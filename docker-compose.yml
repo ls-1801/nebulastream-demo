@@ -1,0 +1,224 @@
+# NebulaStream live-metrics demo.
+#
+# One command:
+#     docker compose -f github.com/nebulastream/nebulastream-demo.git up
+#
+# Topology of this demo:
+#
+#     metrics-feeder  --(TCP, JSON lines)-->  worker  --(File sink, CSV)-->  ./output
+#         (python)                          (nebulastream/worker)
+#                                                 ^
+#                                                 | gRPC (start / status / stop)
+#                                           coordinator
+#                                        (nebulastream/nes-cli)
+#
+# * metrics-feeder : a tiny python TCP server that emits one JSON object per second
+#                    describing its own CPU / memory / network usage.
+# * worker         : the NebulaStream engine. It connects out to the feeder as a TCP
+#                    source, runs a 5-second tumbling-window aggregation, and writes
+#                    the windowed results to /output/metrics-windows.csv.
+# * coordinator    : runs nes-cli in a bash loop. It `start`s the query, traps SIGTERM
+#                    to `stop` the query on shutdown, and `status`-monitors it in between.
+#
+# Everything (topology, feeder script, coordinator script) is embedded below via
+# `configs`, so this single file is fully self-contained.
+
+services:
+  # ---------------------------------------------------------------------------
+  # NebulaStream engine. Identified in the topology as `worker:8080` (gRPC).
+  # ---------------------------------------------------------------------------
+  worker:
+    image: nebulastream/worker:latest
+    command: ["--grpc=0.0.0.0:8080", "--data_address=worker:9090"]
+    ports:
+      - "8080:8080"          # expose gRPC for poking from the host (optional)
+    volumes:
+      - ./output:/output     # windowed results land here as CSV
+    healthcheck:
+      # grpc_health_probe ships inside the runtime image
+      test: ["CMD", "/bin/grpc_health_probe", "-addr=127.0.0.1:8080"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+      start_period: 20s
+
+  # ---------------------------------------------------------------------------
+  # Python TCP server. The worker's TCP source connects to `metrics-feeder:5000`.
+  # ---------------------------------------------------------------------------
+  metrics-feeder:
+    image: python:3.12-slim
+    command: ["python", "-u", "/feeder.py"]
+    configs:
+      - source: feeder_py
+        target: /feeder.py
+
+  # ---------------------------------------------------------------------------
+  # nes-cli driver: start -> trap-stop -> monitor.
+  # The base image's entrypoint is `nes-cli`; we override it to run our script.
+  # XDG_STATE_HOME=/state (set in the image) keeps the query-id mapping that
+  # `start` writes and `stop`/`status` read.
+  # ---------------------------------------------------------------------------
+  coordinator:
+    image: nebulastream/nes-cli:latest
+    entrypoint: ["/bin/bash", "/demo/run.sh"]
+    working_dir: /tmp
+    depends_on:
+      worker:
+        condition: service_healthy
+      metrics-feeder:
+        condition: service_started
+    configs:
+      - source: topology
+        target: /demo/topology.yaml
+      - source: run_sh
+        target: /demo/run.sh
+
+configs:
+  # ===========================================================================
+  # NebulaStream topology: TCP/JSON source -> tumbling window -> File sink.
+  # Field names are UPPER-CASED by NebulaStream, so the feeder emits UPPER-CASE
+  # JSON keys (TS, CPU_PCT, ...) to match the schema below.
+  # `$` is doubled ($$) only to escape Compose variable interpolation.
+  # ===========================================================================
+  topology:
+    content: |
+      query: |
+        SELECT
+          start, end,
+          AVG(CPU_PCT)    AS avg_cpu_pct,
+          MAX(MEM_BYTES)  AS max_mem_bytes,
+          AVG(NET_RX_BPS) AS avg_net_rx_bps
+        FROM metrics
+        WINDOW TUMBLING(TS, SIZE 5 SEC)
+        INTO metrics_window
+
+      logical:
+        - name: metrics
+          schema:
+            - name: ts
+              type: UINT64
+            - name: cpu_pct
+              type: FLOAT64
+            - name: mem_bytes
+              type: UINT64
+            - name: net_rx_bps
+              type: FLOAT64
+
+      physical:
+        - logical: metrics
+          host: worker:8080
+          type: TCP
+          parser_config:
+            type: JSON
+          source_config:
+            socket_host: metrics-feeder
+            socket_port: "5000"
+
+      sinks:
+        - name: metrics_window
+          host: worker:8080
+          type: File
+          schema:
+            - name: metrics$$start
+              type: UINT64
+            - name: metrics$$end
+              type: UINT64
+            - name: metrics$$avg_cpu_pct
+              type: FLOAT64
+            - name: metrics$$max_mem_bytes
+              type: UINT64
+            - name: metrics$$avg_net_rx_bps
+              type: FLOAT64
+          config:
+            file_path: /output/metrics-windows.csv
+            output_format: CSV
+            append: "true"
+          parser_config: { }
+
+      workers:
+        - host: worker:8080
+          data_address: worker:9090
+          max_operators: 10000
+
+  # ===========================================================================
+  # The metrics feeder. Same algorithm as the reference snippet, wrapped in a
+  # TCP server and emitting UPPER-CASE JSON keys (one object per line).
+  # ===========================================================================
+  feeder_py:
+    content: |
+      import json, socket, time
+
+      def cpu_usec():
+          for l in open("/sys/fs/cgroup/cpu.stat"):
+              if l.startswith("usage_usec"):
+                  return int(l.split()[1])
+          return 0
+
+      def rx_bytes():
+          return sum(int(l.split()[1]) for l in open("/proc/net/dev").readlines()[2:])
+
+      def mem_bytes():
+          return int(open("/sys/fs/cgroup/memory.current").read())
+
+      def stream(conn):
+          prev_c, prev_r, t = cpu_usec(), rx_bytes(), time.time()
+          while True:
+              time.sleep(1)
+              c, r, now = cpu_usec(), rx_bytes(), time.time()
+              rec = {
+                  "TS": int(now * 1000),
+                  "CPU_PCT": (c - prev_c) / 1e6 / (now - t) * 100,
+                  "MEM_BYTES": mem_bytes(),
+                  "NET_RX_BPS": (r - prev_r) / (now - t),
+              }
+              conn.sendall((json.dumps(rec) + "\n").encode())
+              prev_c, prev_r, t = c, r, now
+
+      def main():
+          srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+          srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+          srv.bind(("0.0.0.0", 5000))
+          srv.listen(1)
+          print("metrics-feeder listening on 0.0.0.0:5000", flush=True)
+          while True:
+              conn, addr = srv.accept()
+              print(f"client connected: {addr}", flush=True)
+              try:
+                  stream(conn)
+              except (BrokenPipeError, ConnectionResetError, OSError) as e:
+                  print(f"client disconnected: {e}", flush=True)
+              finally:
+                  conn.close()
+
+      main()
+
+  # ===========================================================================
+  # Coordinator script: start the query, register a stop hook, then monitor.
+  # `$` is doubled ($$) to escape Compose interpolation -> real `$` at runtime.
+  # ===========================================================================
+  run_sh:
+    content: |
+      #!/usr/bin/env bash
+      set -euo pipefail
+      TOPOLOGY=/demo/topology.yaml
+
+      echo "[coordinator] submitting query from $$TOPOLOGY ..."
+      QID="$$(nes-cli -t "$$TOPOLOGY" start)"
+      echo "[coordinator] query started, id = $$QID"
+
+      stop_query() {
+        echo "[coordinator] stopping query $$QID ..."
+        nes-cli -t "$$TOPOLOGY" stop "$$QID" || true
+        echo "[coordinator] stopped."
+        exit 0
+      }
+      trap stop_query INT TERM
+
+      echo "[coordinator] monitoring query (stop the demo with: docker compose down)"
+      while true; do
+        echo "===== $$(date -u +%Y-%m-%dT%H:%M:%SZ) :: status of $$QID ====="
+        nes-cli -t "$$TOPOLOGY" status "$$QID" || echo "[coordinator] status check failed (is the worker reachable?)"
+        # background sleep + wait so SIGTERM interrupts immediately
+        sleep 5 &
+        wait $$!
+      done
