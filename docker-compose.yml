@@ -5,7 +5,7 @@
 #
 # Topology of this demo:
 #
-#     metrics-feeder  --(TCP, JSON lines)-->  worker  --(File sink, CSV)-->  ./output
+#     metrics-feeder  --(TCP, JSON lines)-->  worker  --(Print sink, JSON)-->  worker stdout
 #         (python)                          (nebulastream/worker)
 #                                                 ^
 #                                                 | gRPC (start / status / stop)
@@ -15,8 +15,9 @@
 # * metrics-feeder : a tiny python TCP server that emits one JSON object per second
 #                    describing its own CPU / memory / network usage.
 # * worker         : the NebulaStream engine. It connects out to the feeder as a TCP
-#                    source, runs a 5-second tumbling-window aggregation, and writes
-#                    the windowed results to /output/metrics-windows.csv.
+#                    source, runs a 5-second tumbling-window aggregation, and prints
+#                    the windowed results as JSON to its stdout
+#                    (view with `docker compose logs -f worker`).
 # * coordinator    : runs nes-cli in a bash loop. It `start`s the query, traps SIGTERM
 #                    to `stop` the query on shutdown, and `status`-monitors it in between.
 #
@@ -30,17 +31,12 @@ services:
   worker:
     image: nebulastream/worker:latest
     command: ["--grpc=0.0.0.0:8080", "--data_address=worker:9090"]
-    ports:
-      - "8080:8080"          # expose gRPC for poking from the host (optional)
-    volumes:
-      - ./output:/output     # windowed results land here as CSV
     healthcheck:
       # grpc_health_probe ships inside the runtime image
       test: ["CMD", "/bin/grpc_health_probe", "-addr=127.0.0.1:8080"]
-      interval: 3s
+      interval: 1s
       timeout: 3s
       retries: 20
-      start_period: 20s
 
   # ---------------------------------------------------------------------------
   # Python TCP server. The worker's TCP source connects to `metrics-feeder:5000`.
@@ -59,7 +55,7 @@ services:
   # `start` writes and `stop`/`status` read.
   # ---------------------------------------------------------------------------
   coordinator:
-    # nes-cli plus jq (used to pull the global query's status out of the JSON).
+    # nes-cli plus jq
     build:
       dockerfile_inline: |
         FROM nebulastream/nes-cli:latest
@@ -81,21 +77,26 @@ services:
 
 configs:
   # ===========================================================================
-  # NebulaStream topology: TCP/JSON source -> tumbling window -> File sink.
+  # NebulaStream topology: TCP/JSON source -> tumbling window -> Print sink.
   # Field names are UPPER-CASED by NebulaStream, so the feeder emits UPPER-CASE
   # JSON keys (TS, CPU_PCT, ...) to match the schema below.
-  # `$` is doubled ($$) only to escape Compose variable interpolation.
   # ===========================================================================
   topology:
     content: |
       query: |
-        SELECT
-          start, end,
-          AVG(CPU_PCT)    AS avg_cpu_pct,
-          MAX(MEM_BYTES)  AS max_mem_bytes,
-          AVG(NET_RX_BPS) AS avg_net_rx_bps
-        FROM metrics
-        WINDOW TUMBLING(TS, SIZE 5 SEC)
+        SELECT start as `start`, end as `end`,
+               avg_cpu_pct as `avg_cpu_pct`,
+               max_mem_bytes as `max_mem_bytes`, 
+               avg_net_rx_bps as `avg_net_rx_bps`
+        FROM(       
+          SELECT
+            start, end,
+            AVG(CPU_PCT)    AS avg_cpu_pct,
+            MAX(MEM_BYTES)  AS max_mem_bytes,
+            AVG(NET_RX_BPS) AS avg_net_rx_bps
+          FROM metrics
+          WINDOW TUMBLING(TS, SIZE 5 SEC)
+        )
         INTO metrics_window
 
       logical:
@@ -117,6 +118,7 @@ configs:
           parser_config:
             type: JSON
           source_config:
+            flush_interval_ms: 100
             socket_host: metrics-feeder
             socket_port: "5000"
 
@@ -125,18 +127,18 @@ configs:
           host: worker:8080
           type: Print
           schema:
-            - name: metrics$$start
+            - name: "`start`"
               type: UINT64
-            - name: metrics$$end
+            - name: "`end`"
               type: UINT64
-            - name: metrics$$avg_cpu_pct
+            - name: "`avg_cpu_pct`"
               type: FLOAT64
-            - name: metrics$$max_mem_bytes
+            - name: "`max_mem_bytes`"
               type: UINT64
-            - name: metrics$$avg_net_rx_bps
+            - name: "`avg_net_rx_bps`"
               type: FLOAT64
           config:
-            output_format: CSV
+            output_format: JSON
           parser_config: { }
 
       workers:
@@ -150,7 +152,13 @@ configs:
   # ===========================================================================
   feeder_py:
     content: |
-      import json, socket, time
+      import json, socket, time, signal
+
+      class Shutdown(Exception):
+          pass
+
+      def _shutdown(signum, frame):
+          raise Shutdown
 
       def cpu_usec():
           for l in open("/sys/fs/cgroup/cpu.stat"):
@@ -179,20 +187,26 @@ configs:
               prev_c, prev_r, t = c, r, now
 
       def main():
+          signal.signal(signal.SIGTERM, _shutdown)
           srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
           srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
           srv.bind(("0.0.0.0", 5000))
           srv.listen(1)
           print("metrics-feeder listening on 0.0.0.0:5000", flush=True)
-          while True:
-              conn, addr = srv.accept()
-              print(f"client connected: {addr}", flush=True)
-              try:
-                  stream(conn)
-              except (BrokenPipeError, ConnectionResetError, OSError) as e:
-                  print(f"client disconnected: {e}", flush=True)
-              finally:
-                  conn.close()
+          try:
+              while True:
+                  conn, addr = srv.accept()
+                  print(f"client connected: {addr}", flush=True)
+                  try:
+                      stream(conn)
+                  except (BrokenPipeError, ConnectionResetError, OSError) as e:
+                      print(f"client disconnected: {e}", flush=True)
+                  finally:
+                      conn.close()
+          except (Shutdown, KeyboardInterrupt):
+              print("metrics-feeder shutting down", flush=True)
+          finally:
+              srv.close()
 
       main()
 
@@ -206,19 +220,19 @@ configs:
       set -euo pipefail
       TOPOLOGY=/demo/topology.yaml
 
-      echo "[coordinator] submitting query from $$TOPOLOGY ..."
+      echo "submitting query from $$TOPOLOGY ..."
       QID="$$(nes-cli -t "$$TOPOLOGY" start)"
-      echo "[coordinator] query started, id = $$QID"
+      echo "query started, id = $$QID"
 
       stop_query() {
-        echo "[coordinator] stopping query $$QID ..."
+        echo "stopping query $$QID ..."
         nes-cli -t "$$TOPOLOGY" stop "$$QID" || true
-        echo "[coordinator] stopped."
+        echo "stopped."
         exit 0
       }
       trap stop_query INT TERM
 
-      echo "[coordinator] monitoring query (stop the demo with: docker compose down)"
+      echo "monitoring query (stop the demo with: docker compose down)"
       while true; do
         # `status` returns an array: the global query plus one entry per worker.
         # Print only the global query's status (the entry without a `local_query_id`).
