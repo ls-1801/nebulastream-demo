@@ -1,7 +1,7 @@
 # NebulaStream live-metrics demo.
 #
 # One command:
-#     docker compose -f github.com/nebulastream/nebulastream-demo.git up
+#     docker compose -f github.com/ls-1801/nebulastream-demo.git up
 #
 # Topology of this demo:
 #
@@ -59,7 +59,13 @@ services:
   # `start` writes and `stop`/`status` read.
   # ---------------------------------------------------------------------------
   coordinator:
-    image: nebulastream/nes-cli:latest
+    # nes-cli plus jq (used to pull the global query's status out of the JSON).
+    build:
+      dockerfile_inline: |
+        FROM nebulastream/nes-cli:latest
+        RUN apt-get update \
+         && apt-get install -y --no-install-recommends jq \
+         && rm -rf /var/lib/apt/lists/*
     entrypoint: ["/bin/bash", "/demo/run.sh"]
     working_dir: /tmp
     depends_on:
@@ -117,7 +123,7 @@ configs:
       sinks:
         - name: metrics_window
           host: worker:8080
-          type: File
+          type: Print
           schema:
             - name: metrics$$start
               type: UINT64
@@ -130,9 +136,7 @@ configs:
             - name: metrics$$avg_net_rx_bps
               type: FLOAT64
           config:
-            file_path: /output/metrics-windows.csv
             output_format: CSV
-            append: "true"
           parser_config: { }
 
       workers:
@@ -216,8 +220,12 @@ configs:
 
       echo "[coordinator] monitoring query (stop the demo with: docker compose down)"
       while true; do
-        echo "===== $$(date -u +%Y-%m-%dT%H:%M:%SZ) :: status of $$QID ====="
-        nes-cli -t "$$TOPOLOGY" status "$$QID" || echo "[coordinator] status check failed (is the worker reachable?)"
+        # `status` returns an array: the global query plus one entry per worker.
+        # Print only the global query's status (the entry without a `local_query_id`).
+        STATUS="$$(nes-cli -t "$$TOPOLOGY" status "$$QID" \
+          | jq -r '.[] | select(has("local_query_id") | not) | .query_status')" \
+          || STATUS="unknown (status check failed; is the worker reachable?)"
+        echo "$$(date -u +%Y-%m-%dT%H:%M:%SZ) :: $$QID :: $$STATUS"
         # background sleep + wait so SIGTERM interrupts immediately
         sleep 5 &
         wait $$!

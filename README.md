@@ -3,14 +3,14 @@
 A self-contained NebulaStream demo you can launch with a single command:
 
 ```bash
-docker compose -f github.com/nebulastream/nebulastream-demo.git up
+docker compose -f github.com/ls-1801/nebulastream-demo.git up
 ```
 
 > Requires Docker Compose **v2.23.1+** (for inline `configs` content). If your
 > Compose is older, or the remote-git form is unavailable, clone first:
 >
 > ```bash
-> git clone https://github.com/nebulastream/nebulastream-demo.git
+> git clone https://github.com/ls-1801/nebulastream-demo.git
 > cd nebulastream-demo
 > docker compose up
 > ```
@@ -32,7 +32,7 @@ Three services, all wired up in [`docker-compose.yml`](docker-compose.yml):
 |------------------|--------------------------------|------|
 | `metrics-feeder` | `python:3.12-slim`             | A tiny TCP server that emits one JSON object per second with its own CPU%, memory, and network-RX. |
 | `worker`         | `nebulastream/worker:latest`   | The NebulaStream engine. Connects out to the feeder as a TCP source, runs a 5-second tumbling-window aggregation, and writes results to `/output`. |
-| `coordinator`    | `nebulastream/nes-cli:latest`  | Drives the query with `nes-cli`: **start** → trap a **stop** hook on the returned query id → **status**-monitor in a loop. |
+| `coordinator`    | `nebulastream/nes-cli:latest` (+ `jq`) | Drives the query with `nes-cli`: **start** → trap a **stop** hook on the returned query id → **status**-monitor in a loop. Built from a small inline Dockerfile that adds `jq`. |
 
 ## The query
 
@@ -49,7 +49,8 @@ INTO metrics_window
 
 ## What you'll see
 
-- **`coordinator` logs**: the assigned query id, then a `status` snapshot every 5 seconds.
+- **`coordinator` logs**: the assigned query id, then a one-line `status` of the
+  global query (e.g. `Running`) every 5 seconds.
 - **`worker` logs**: engine startup and query execution.
 - **`./output/metrics-windows.csv`**: one CSV row per 5-second window —
   `start,end,avg_cpu_pct,max_mem_bytes,avg_net_rx_bps`. The first row appears
